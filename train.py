@@ -32,11 +32,12 @@ def _configure_torch(device: str) -> str:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if device == "cuda" and torch.cuda.is_available():
-        # Faster convolution kernels (important for CnnPolicy)
         torch.backends.cudnn.benchmark = True
-        # TF32: ~2× faster matmul on Ampere/Ada GPUs with negligible precision loss
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        # TF32 only works on Ampere+ (compute capability >= 8.0); no-op on T4 (7.5)
+        cap = torch.cuda.get_device_capability()
+        if cap[0] >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
     return device
 
@@ -46,7 +47,8 @@ def parse_args():
 
     # Environment
     p.add_argument("--action-set", choices=["simple", "complex", "right"], default="simple")
-    p.add_argument("--n-envs", type=int, default=8, help="Number of parallel environments")
+    p.add_argument("--n-envs", type=int, default=min(os.cpu_count() or 2, 8),
+                   help="Number of parallel environments (default: min(cpu_count, 8))")
     p.add_argument("--n-stack", type=int, default=4, help="Frames to stack as observation")
     p.add_argument(
         "--multiprocess",
