@@ -25,13 +25,18 @@ def parse_args():
         description="Preview the observation pipeline used during PPO training"
     )
     parser.add_argument("--action-set", choices=ACTION_SETS.keys(), default="simple")
-    parser.add_argument("--n-stack", type=int, default=4)
+    parser.add_argument("--n-stack", type=int, default=2)
     parser.add_argument("--scale", type=int, default=5)
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument(
         "--random",
         action="store_true",
         help="Sample random actions instead of using keyboard input",
+    )
+    parser.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help="Hide debug text overlay and only show the training frames",
     )
     return parser.parse_args()
 
@@ -96,13 +101,53 @@ def stack_grid(obs):
     return grid
 
 
-def draw_gray(screen, frame, scale):
+def reward_component_text(info):
+    components = info.get("reward_components") or {}
+    if not components:
+        return "components: n/a"
+
+    keys = ("x", "death", "boss", "score", "enemy_clear", "shoot_enemy")
+    return "components: " + " ".join(
+        f"{key}={components.get(key, 0)}" for key in keys
+    )
+
+
+def debug_lines(obs, action_name, reward, done, info):
+    return [
+        f"obs={obs.shape} action={action_name} reward={reward:.1f} done={bool(done[0])}",
+        f"active_enemies={info.get('active_enemies', '?')} "
+        f"visible_threats={info.get('visible_threat_sprites', '?')} "
+        f"x={info.get('x_pos', '?')} y={info.get('y_pos', '?')} "
+        f"lives={info.get('life', '?')} score={info.get('score', '?')}",
+        f"raw_type_count={info.get('active_enemy_types', '?')} "
+        f"enemy_slots={info.get('enemy_slots', '?')} "
+        f"baseline={info.get('enemy_baseline', '?')}",
+        reward_component_text(info),
+        "keys: arrows move/aim, Z=A jump, X=B shoot, R=reset, Esc/Q=quit",
+    ]
+
+
+def draw_overlay(screen, font, lines):
+    line_height = font.get_height() + 4
+    panel_height = line_height * len(lines) + 12
+    panel = pygame.Surface((screen.get_width(), panel_height), pygame.SRCALPHA)
+    panel.fill((0, 0, 0, 180))
+    screen.blit(panel, (0, 0))
+
+    for index, line in enumerate(lines):
+        text = font.render(line, True, (255, 255, 255))
+        screen.blit(text, (8, 6 + index * line_height))
+
+
+def draw_gray(screen, frame, scale, font=None, overlay_lines=None):
     rgb = np.repeat(frame[:, :, None], 3, axis=2)
     surface = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
     if scale != 1:
         width, height = frame.shape[1] * scale, frame.shape[0] * scale
         surface = pygame.transform.scale(surface, (width, height))
     screen.blit(surface, (0, 0))
+    if font is not None and overlay_lines:
+        draw_overlay(screen, font, overlay_lines)
     pygame.display.flip()
 
 
@@ -119,6 +164,7 @@ def main():
     obs = env.reset()
 
     pygame.init()
+    font = pygame.font.Font(None, 24)
     preview = stack_grid(obs)
     height, width = preview.shape[:2]
     screen = pygame.display.set_mode((width * args.scale, height * args.scale))
@@ -166,12 +212,16 @@ def main():
                 time.sleep(0.05)
 
             preview = stack_grid(obs)
-            draw_gray(screen, preview, args.scale)
-
             action_name = "+".join(actions[action])
+            overlay_lines = None
+            if not args.no_overlay:
+                overlay_lines = debug_lines(obs, action_name, reward, done, info)
+            draw_gray(screen, preview, args.scale, font, overlay_lines)
+
             pygame.display.set_caption(
                 "Train env preview | "
                 f"obs={obs.shape} action={action_name} reward={reward:.1f} "
+                f"active_enemies={info.get('active_enemies', '?')} "
                 f"x={info.get('x_pos', '?')} lives={info.get('life', '?')} "
                 f"score={info.get('score', '?')}"
             )

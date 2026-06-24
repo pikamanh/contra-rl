@@ -44,16 +44,29 @@ class ContraCallback(BaseCallback):
 
         self.best_mean_reward = -np.inf
         self.epoch = 0
+        self.shoot_action_count = 0
+        self.shoot_when_enemy_count = 0
+        self.env_step_count = 0
 
     # ------------------------------------------------------------------
     # SB3 hooks
     # ------------------------------------------------------------------
 
     def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        self.env_step_count += len(infos)
+
+        for info in infos:
+            if info.get("is_shooting", False):
+                self.shoot_action_count += 1
+                if info.get("active_enemies", 0) > 0:
+                    self.shoot_when_enemy_count += 1
+
         return True
 
     def _on_rollout_end(self) -> None:
         self.epoch += 1
+        self._report_shoot_stats()
         self._save_latest()
         self._maybe_save_best()
 

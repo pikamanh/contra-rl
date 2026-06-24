@@ -5,8 +5,44 @@ import time
 from Contra.ROMs.decode_target import decode_target
 from Contra.ROMs.rom_path import rom_path
 
+# Các hằng số dưới đây phục vụ reward/risk shaping.
+#
+# Nhóm enemy type RAM chỉ giữ để debug/đối chiếu. Qua inspect thực tế,
+# các address này có thể nhiễu khi bắn nên KHÔNG còn là nguồn chính để
+# quyết định active_enemies.
 _STAGE_OVER_ENEMIES = np.array([0x2D, 0x31])
-_ENEMY_TYPE_ADDRESSES = [0x0016, 0x0017, 0x0018, 0x0019, 0x001A]
+_IGNORED_ENEMY_TYPES = {0x2D, 0x31}
+_ENEMY_TYPE_ADDRESSES = [0x0016, 0x0017, 0x0018, 0x0019]
+
+# Reward tuning:
+# - enemy_clear: thưởng khi score tăng do bắn chết enemy hoặc vượt qua threat.
+# - score_delta: scale điểm mới kiếm được, không cộng tổng score mỗi frame.
+# - shoot_active_enemy: thưởng nhỏ khi agent bấm B lúc có threat phía trước.
+_ENEMY_CLEAR_REWARD = 8
+_SCORE_DELTA_REWARD_SCALE = 5
+_SHOOT_ACTIVE_ENEMY_REWARD = 0.5
+
+# NES controller bitmask: nút B có bit 0x02 trong action bitmap của nes-py.
+_BUTTON_B_MASK = 0x02
+
+# OAM/sprite RAM của NES. Đây là nguồn chính để detect enemy/threat đang
+# hiển thị phía trước player, vì nó khớp với thứ model nhìn thấy trên frame.
+_OAM_START = 0x0200
+_OAM_END = 0x0300
+_OAM_ENTRY_SIZE = 4
+
+# Bộ lọc sprite threat:
+# - chỉ tính sprite nằm trong vùng màn hình chơi, không tính HUD phía trên.
+# - chỉ tính sprite đủ xa bên phải để tránh count player thành enemy.
+# - gom các sprite gần nhau thành một threat vì một enemy gồm nhiều sprite.
+_VISIBLE_SPRITE_Y_MAX = 239
+_THREAT_SPRITE_X_MIN = 150
+_THREAT_SPRITE_Y_MIN = 32
+_THREAT_CLUSTER_WIDTH = 16
+
+# Tile 0x0E thường là đạn/projectile; bỏ qua để việc bấm B không tạo
+# visible_threat giả.
+_IGNORED_THREAT_SPRITE_TILES = {0x0E}
 
 
 class ContraEnv(NESEnv):
@@ -31,6 +67,12 @@ class ContraEnv(NESEnv):
         # The .nes file path name abso
         self._rom_path = rom_path()
         self._dead_count = 0
+        self._score_last = 0
+        self._enemy_count_last = 0
+        self._enemy_type_baseline = [0] * len(_ENEMY_TYPE_ADDRESSES)
+        self._last_reward_components = {}
+        self._shoot_action_count = 0
+        self._shoot_when_enemy_count = 0
 
         # self._time_start = time.time()
 
@@ -149,6 +191,9 @@ class ContraEnv(NESEnv):
     @property
     def _x_reward(self):
         """Return the reward based on left right movement between steps."""
+        # Reward tiến độ: agent được điểm khi x_position tăng, tức đi sang phải.
+        # Đây là tín hiệu chính thúc agent phá màn, nhưng nếu quá mạnh agent có
+        # thể học lao thẳng vào enemy thay vì bắn/né.
         # Cast to int to avoid numpy uint8 overflow when position decreases
         _reward = int(self._x_position) - int(self._x_position_last)
         self._x_position_last = self._x_position
@@ -162,9 +207,135 @@ class ContraEnv(NESEnv):
     @property
     def _death_penalty(self):
         """Return the reward earned by dying."""
+        # Risk chính: nếu đang chết hoặc đã chết thì phạt mạnh.
+        # nes-py sẽ clip reward cuối vào reward_range (-15, 15), nên -25 cuối
+        # cùng thường thành -15 ở output step().
         if self._is_dying or self._is_dead:
             return -25
 
+        return 0
+
+    @property
+    def _enemy_type_slots(self):
+        """Return raw enemy type slot values from RAM."""
+        # RAM type slot này dùng để debug. Thực tế đã thấy nó có thể không đổi
+        # khi enemy xuất hiện hoặc bị nhiễu khi bắn, nên không dùng làm tín hiệu
+        # reward chính.
+        return [int(self.ram[address]) for address in _ENEMY_TYPE_ADDRESSES]
+
+    @property
+    def _active_enemy_count(self):
+        """Return the number of active enemy slots currently visible."""
+        # active_enemies hiện dựa trên sprite/OAM visible phía trước player.
+        # Không dùng raw enemy type slots vì slots đó nhiễu với hành động bắn.
+        return self._visible_threat_sprite_count
+
+    @property
+    def _active_enemy_type_count(self):
+        """Return active enemy count from known type slots."""
+        # Chỉ xuất ra info để inspect/debug, không dùng quyết định reward chính.
+        return sum(
+            1
+            for enemy_type, baseline_type in zip(
+                self._enemy_type_slots, self._enemy_type_baseline
+            )
+            if (
+                enemy_type != baseline_type
+                and enemy_type != 0
+                and enemy_type not in _IGNORED_ENEMY_TYPES
+            )
+        )
+
+    @property
+    def _visible_threat_sprite_count(self):
+        """Estimate visible threats using OAM sprites in front of the player."""
+        # OAM là vùng RAM chứa sprite đang được NES vẽ lên màn hình.
+        # Mỗi sprite có 4 byte: y, tile, attribute, x.
+        # Ta lọc các sprite nằm phía trước player để ước lượng có enemy/threat.
+        xs = []
+        for address in range(_OAM_START, _OAM_END, _OAM_ENTRY_SIZE):
+            y = int(self.ram[address])
+            tile = int(self.ram[address + 1])
+            x = int(self.ram[address + 3])
+
+            if (
+                _THREAT_SPRITE_Y_MIN <= y <= _VISIBLE_SPRITE_Y_MAX
+                and x >= _THREAT_SPRITE_X_MIN
+                and tile != 0
+                and tile not in _IGNORED_THREAT_SPRITE_TILES
+            ):
+                xs.append(x)
+
+        if not xs:
+            return 0
+
+        # Một enemy thường gồm nhiều sprite sát nhau, nên gom theo cụm trục X
+        # để tránh đếm một enemy thành nhiều enemy.
+        xs.sort()
+        clusters = 1
+        last_x = xs[0]
+        for x in xs[1:]:
+            if x - last_x > _THREAT_CLUSTER_WIDTH:
+                clusters += 1
+            last_x = x
+        return clusters
+
+    def _score_reward(self):
+        """Reward only newly earned score instead of total score every frame."""
+        # Chỉ thưởng phần score mới tăng. Nếu cộng tổng score mỗi frame thì agent
+        # sẽ nhận reward lớn lặp lại liên tục và làm méo tín hiệu học.
+        score = self._score()
+        score_delta = score - self._score_last
+        self._score_last = score
+
+        if score_delta <= 0:
+            return 0
+
+        return score_delta * _SCORE_DELTA_REWARD_SCALE
+
+    def _enemy_clear_reward(self, x_reward, score_reward):
+        """Reward killing or passing enemies when enemy slots disappear."""
+        # Nếu score tăng, coi đó là tín hiệu kill đáng tin nhất và thưởng
+        # enemy_clear. Không phụ thuộc hoàn toàn vào enemy count giảm vì OAM
+        # sprite có thể còn animation vài frame sau khi enemy chết.
+        enemy_count = self._active_enemy_count
+        cleared = max(0, self._enemy_count_last - enemy_count)
+        self._enemy_count_last = enemy_count
+
+        if score_reward > 0:
+            return max(1, cleared) * _ENEMY_CLEAR_REWARD
+
+        # Nếu không có score tăng nhưng threat phía trước biến mất khi agent vẫn
+        # tiến lên, coi như đã vượt qua/né qua enemy và thưởng nhẹ theo số cụm
+        # threat giảm.
+        # Score increases usually mean the enemy was killed. If the agent moved
+        # forward and an enemy despawned, treat it as successfully passing it.
+        if cleared > 0 and x_reward > 0:
+            return cleared * _ENEMY_CLEAR_REWARD
+
+        return 0
+
+    @property
+    def _is_shooting(self):
+        """Return True when the current action presses the B button."""
+        # Kiểm tra action hiện tại có bit nút B không.
+        return bool(int(self.controllers[0][0]) & _BUTTON_B_MASK)
+
+    def _shoot_active_enemy_reward(self):
+        """Small reward for shooting while at least one enemy is active."""
+        # Thưởng rất nhỏ để agent có lý do thử bắn khi có threat phía trước.
+        # Đây không phải reward kill; kill thật vẫn được thưởng qua score_reward
+        # và enemy_clear_reward.
+        is_shooting = self._is_shooting
+        has_enemy = self._active_enemy_count > 0
+
+        if is_shooting:
+            self._shoot_action_count += 1
+            if has_enemy:
+                self._shoot_when_enemy_count += 1
+
+        if has_enemy and is_shooting:
+            return _SHOOT_ACTIVE_ENEMY_REWARD
         return 0
 
     # MARK: nes-py API calls
@@ -172,11 +343,23 @@ class ContraEnv(NESEnv):
         """Handle and RAM hacking before a reset occurs."""
         self._x_position_last = 0
         self._dead_count = 0
+        self._score_last = 0
+        self._enemy_count_last = 0
+        self._enemy_type_baseline = [0] * len(_ENEMY_TYPE_ADDRESSES)
+        self._last_reward_components = {}
+        self._shoot_action_count = 0
+        self._shoot_when_enemy_count = 0
 
     def _did_reset(self):
         """Handle any RAM hacking after a reset occurs."""
         self._x_position_last = self._x_position
         self._dead_count = 0
+        self._score_last = self._score()
+        self._enemy_type_baseline = self._enemy_type_slots
+        self._enemy_count_last = self._active_enemy_count
+        self._last_reward_components = {}
+        self._shoot_action_count = 0
+        self._shoot_when_enemy_count = 0
 
     # have to recode
     def _did_step(self, done):
@@ -208,7 +391,35 @@ class ContraEnv(NESEnv):
 
     def _get_reward(self):
         """Return the reward after a step occurs."""
-        return self._x_reward + self._death_penalty + self._get_boss_defeated_reward() + self._score()
+        # Công thức reward cuối:
+        #   x               : đi sang phải
+        #   death           : risk/phạt chết
+        #   boss            : thắng boss
+        #   score           : điểm mới kiếm được, thường do bắn trúng/kill
+        #   enemy_clear     : kill hoặc vượt qua threat
+        #   shoot_enemy     : bấm B khi có threat phía trước
+        #
+        # Lưu ý: NESEnv.step() sẽ clip tổng reward vào reward_range (-15, 15).
+        x_reward = self._x_reward
+        score_reward = self._score_reward()
+        enemy_clear_reward = self._enemy_clear_reward(x_reward, score_reward)
+        shoot_enemy_reward = self._shoot_active_enemy_reward()
+        self._last_reward_components = dict(
+            x=x_reward,
+            death=self._death_penalty,
+            boss=self._get_boss_defeated_reward(),
+            score=score_reward,
+            enemy_clear=enemy_clear_reward,
+            shoot_enemy=shoot_enemy_reward,
+        )
+        return (
+            x_reward
+            + self._last_reward_components["death"]
+            + self._last_reward_components["boss"]
+            + score_reward
+            + enemy_clear_reward
+            + shoot_enemy_reward
+        )
 
     @property
     def _get_boss_defeated(self):
@@ -252,7 +463,16 @@ class ContraEnv(NESEnv):
             status=self._player_state,
             x_pos=self._x_position,
             y_pos=self._y_position,
-            defeated=self._get_boss_defeated
+            defeated=self._get_boss_defeated,
+            active_enemies=self._active_enemy_count,
+            active_enemy_types=self._active_enemy_type_count,
+            visible_threat_sprites=self._visible_threat_sprite_count,
+            enemy_slots=self._enemy_type_slots,
+            enemy_baseline=self._enemy_type_baseline,
+            is_shooting=self._is_shooting,
+            shoot_action_count=self._shoot_action_count,
+            shoot_when_enemy_count=self._shoot_when_enemy_count,
+            reward_components=self._last_reward_components,
         )
 
 
