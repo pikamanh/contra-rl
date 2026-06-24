@@ -149,11 +149,9 @@ class ContraEnv(NESEnv):
     @property
     def _x_reward(self):
         """Return the reward based on left right movement between steps."""
-        # print("self._x_position", self._x_position)
-        _reward = self._x_position - self._x_position_last
-        # print("_reward ", _reward)
+        # Cast to int to avoid numpy uint8 overflow when position decreases
+        _reward = int(self._x_position) - int(self._x_position_last)
         self._x_position_last = self._x_position
-        # TODO: check whether this is still necessary
         # resolve an issue where after death the x position resets. The x delta
         # is typically has at most magnitude of 3, 5 is a safe bound
         if _reward < -5 or _reward > 5:
@@ -246,7 +244,6 @@ class ContraEnv(NESEnv):
 
     def _get_info(self):
         """Return the info after a step occurs"""
-        print("Score", self._score())
         return dict(
             life=self._life,
             dead=self._is_dead,

@@ -4,6 +4,14 @@ import os
 import cv2
 import gym
 import numpy as np
+
+# nes-py 8.2.1 bug: prg_rom_size/chr_rom_size read header bytes as numpy.uint8,
+# causing overflow when multiplied (e.g. uint8(64) * 1024 wraps around).
+# Monkey-patch both properties to cast to int before multiplication.
+import nes_py._rom as _nes_rom
+
+_nes_rom.ROM.prg_rom_size = property(lambda self: 16 * int(self.header[4]))
+_nes_rom.ROM.chr_rom_size = property(lambda self: 8 * int(self.header[5]))
 from gym import ObservationWrapper
 from gym.spaces import Box
 from nes_py.wrappers import JoypadSpace
